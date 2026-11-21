@@ -25,12 +25,60 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Build APK dari ZIP atau proyek langsung
+      - name: Generate debug.keystore & Build APK
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p out _p
 
+          # 1. Buat debug.keystore jika belum tersedia di runner
+          KEYSTORE_DIR="$HOME/.config/.android"
+          KEYSTORE_FILE="$KEYSTORE_DIR/debug.keystore"
+          mkdir -p "$KEYSTORE_DIR"
+
+          if [ ! -f "$KEYSTORE_FILE" ]; then
+            echo "===== Membuat debug.keystore baru ====="
+            keytool -genkeypair \
+              -v \
+              -keystore "$KEYSTORE_FILE" \
+              -storepass android \
+              -alias AndroidDebugKey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Fungsi helper untuk build per root project Android
+          build_android_project() {
+            local ROOT_DIR="$1"
+            local OUT_NAME="$2"
+
+            if [ ! -f "$ROOT_DIR/app/build.gradle" ] && [ ! -f "$ROOT_DIR/app/build.gradle.kts" ]; then
+              echo "::error::app/build.gradle(.kts) tidak ditemukan di $ROOT_DIR"
+              exit 1
+            fi
+
+            echo "===== Signing Report ($OUT_NAME) ====="
+            (cd "$ROOT_DIR" && gradle --no-daemon signingReport) | grep -E "Variant:|Store:|Alias:|SHA1:|SHA-256:|MD5:" || true
+
+            echo "===== Assemble Debug APK ($OUT_NAME) ====="
+            (cd "$ROOT_DIR" && gradle --no-daemon --stacktrace assembleDebug)
+
+            APK="$(find "$ROOT_DIR/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
+            if [ -z "$APK" ]; then
+              echo "::error::APK debug tidak ditemukan untuk $OUT_NAME"
+              exit 1
+            fi
+
+            cp "$APK" "out/$OUT_NAME.apk"
+
+            echo "===== SHA1 dari APK (out/$OUT_NAME.apk) ====="
+            keytool -printcert -jarfile "out/$OUT_NAME.apk" | grep -iE "Owner:|Issuer:|Serial number:|Valid from:|SHA1:|SHA256:" || true
+          }
+
+          # 2. Cek apakah ada file .zip proyek di root repo
           mapfile -t ZIP_FILES < <(find . -maxdepth 1 -type f -name '*.zip' -print | sort)
 
           if [ "${#ZIP_FILES[@]}" -gt 0 ]; then
@@ -45,42 +93,17 @@ jobs:
                 echo "::error::settings.gradle(.kts) tidak ditemukan di $Z"
                 exit 1
               fi
-              ROOT="$(dirname "$SETTINGS")"
 
-              if [ ! -f "$ROOT/app/build.gradle" ] && [ ! -f "$ROOT/app/build.gradle.kts" ]; then
-                echo "::error::app/build.gradle(.kts) tidak ditemukan di $ROOT"
-                exit 1
-              fi
-
-              echo "===== SHA1: $N ====="
-              (cd "$ROOT" && gradle --no-daemon signingReport)
-
-              (cd "$ROOT" && gradle --no-daemon --stacktrace assembleDebug)
-              APK="$(find "$ROOT/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
-              if [ -z "$APK" ]; then
-                echo "::error::APK debug tidak ditemukan untuk $N"
-                exit 1
-              fi
-              cp "$APK" "out/$N.apk"
+              build_android_project "$(dirname "$SETTINGS")" "$N"
             done
           else
-            SETTINGS="$(find . -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -not -path './.gradle/*' -print -quit)"
+            SETTINGS="$(find . -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -not -path './.gradle/*' -not -path './_p/*' -print -quit)"
             if [ -z "$SETTINGS" ]; then
               echo "::error::settings.gradle(.kts) tidak ditemukan"
               exit 1
             fi
-            ROOT="$(dirname "$SETTINGS")"
 
-            echo "===== SHA1: Project langsung ====="
-            (cd "$ROOT" && gradle --no-daemon signingReport)
-
-            (cd "$ROOT" && gradle --no-daemon --stacktrace assembleDebug)
-            APK="$(find "$ROOT/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
-            if [ -z "$APK" ]; then
-              echo "::error::APK debug tidak ditemukan"
-              exit 1
-            fi
-            cp "$APK" out/app.apk
+            build_android_project "$(dirname "$SETTINGS")" "app"
           fi
 
       - name: Upload APK
